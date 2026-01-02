@@ -1,0 +1,21 @@
+[package]
+name = "bybit_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Silnik asynchroniczny (niezbędny do sieci)
+tokio = { version = "1", features = ["full"] }
+
+# Obsługa WebSocketów (połączenie z giełdą)
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+
+# Narzędzia do obsługi strumieni danych
+futures-util = "0.3"
+
+# Obsługa formatu JSON (giełda wysyła napisy w JSON)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Obsługa adresów internetowych
+url = "2.5"
