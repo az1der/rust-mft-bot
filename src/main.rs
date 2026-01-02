@@ -3,6 +3,8 @@ use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 // overbook: a:ask/ b:bid
 #[derive(Deserialize, Debug)]
@@ -21,6 +23,7 @@ struct OrderbookData {
 #[derive(Deserialize,Debug)]
 struct BybitResponse {
     topic: String,
+    ts: u64,
     data: Option<OrderbookData>,
 }
 
@@ -58,8 +61,15 @@ async fn main() {
                                 let best_ask= data.asks.get(0);
 
                                 if let (Some(bid), Some(ask))= (best_bid, best_ask) {
+
+                                    // datatime format: Hrs: Min: Sec: Milsec 
+                                    let d= std::time::UNIX_EPOCH+ Duration::from_millis(parsed.ts);
+                                    let datetime= DateTime::<Utc>::from(d);
+                                    let time_str= datetime.format("%H:%M:%S%.3f").to_string();
+
                                     // bid[0]: price, bid[1]: vol
-                                    println!("{} | Buy: ${} (x{}) | Sell: ${} (x{})",
+                                    println!("{} | {} | Buy: ${} (x{}) | Sell: ${} (x{})",
+                                    time_str,
                                     data.symbol,
                                     bid[0], bid[1],
                                     ask[0], ask[1]);
