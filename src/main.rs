@@ -11,20 +11,33 @@ async fn main() {
     let url= Url::parse(connect_addr).unwrap();
     println!("connecting...");
 
-    let (ws_stream, _)= connect_async(url).await.unwrap();
+    let (ws_stream, _)= connect_async(url)
+        .await
+        .expect("failed to connect");
     println!("connected");
 
     let (mut write, mut read)= ws_stream.split();
     let subscribe_msg= r#"{"op": "subscribe", "args": ["orderbook.1.BTCUSDT"]}"#;
 
-    write.send(Message::Text(subscribe_msg.to_string())).await.unwrap();
+    write.send(Message::Text(subscribe_msg.to_string()))
+        .await
+        .expect("failed to send subscription message");
+    
+    println!("waiting for data...");
 
     //loop
     while let Some(msg)= read.next().await {
-        let message= msg.unwrap();
-
-        //raw data
-        println!("data: {}", message);
+        match msg {
+            Ok(message)=> {
+                if let Message::Text(text)= message {
+                    println!("recived data: {}", text);
+                } 
+            }
+            Err(e)=> {
+                eprintln!("network error: {:?}", e);
+                break;
+            }
+        }
     }
 }
 
