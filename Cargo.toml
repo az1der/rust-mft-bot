@@ -1,15 +1,15 @@
 [package]
-name = "bybit_test"
+name = "binance_mft"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 futures-util = "0.3"
-url = "2.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1" 
 chrono = "0.4"
-parquet = "50.0"
-arrow = "50.0"
+url = "2.4"
+parquet = "50.0" 
+arrow = "50.0"   

@@ -1,172 +1,194 @@
-use futures_util::{StreamExt, SinkExt};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+// change to Binance due to API limitations
+
+// import
+use futures_util::StreamExt;
+use tokio_tungstenite::connect_async;
 use url::Url;
-use serde::Deserialize;
 use chrono::{DateTime, Utc};
 use std::time::{Duration, Instant};
 use std::fs::File;
 use std::sync::Arc;
+use serde_json::Value;
 
-// parquet/ arrow
-use arrow::array::{Float64Builder, StringBuilder, Array};
+use arrow::array::{Float64Builder, StringBuilder, Int64Builder, Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
+// 10 min of collecting data
 const BATCH_SIZE: usize = 100;
-const RUN_TIME_HOURS: u64 = 2;
+const RUN_TIME_MINUTES: u64 = 10;
 
-// orderbook: a:ask/ b:bid
-#[derive(Deserialize, Debug)]
-struct OrderbookData {
-    #[serde(rename= "s")]
-    symbol: String,
-
-    #[serde(default)]
-    b: Vec<Vec<String>>,
-
-    #[serde(default)]
-    #[serde(rename= "a")]
-    asks: Vec<Vec<String>>,
-}
-
-#[derive(Deserialize,Debug)]
-struct BybitResponse {
-    topic: String,
-    ts: u64,
-    data: Option<OrderbookData>,
-}
-
-// tokio asynchronous runtime
 #[tokio::main]
 async fn main() {
-    println!("MFT data collecting..."); // <- POPRAWKA 1: Dodano średnik
+    println!("binance full-depth collector (l20 + trades)...");
 
     let start_time = Instant::now();
-    let max_duration = Duration::from_secs(RUN_TIME_HOURS * 60 * 60);
+    let max_duration = Duration::from_secs(RUN_TIME_MINUTES * 60);
 
+    // schema: json columns for bids/asks
     let schema = Schema::new(vec![
         Field::new("timestamp", DataType::Utf8, false),
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("latency_ms", DataType::Int64, false),
         Field::new("symbol", DataType::Utf8, false),
-        Field::new("bid_price", DataType::Float64, false), 
-        Field::new("bid_qty", DataType::Float64, false),   
-        Field::new("ask_price", DataType::Float64, false), 
-        Field::new("ask_qty", DataType::Float64, false),
+        
+        // trade data
+        Field::new("trade_price", DataType::Float64, false),
+        Field::new("trade_qty", DataType::Float64, false),
+        Field::new("trade_side", DataType::Utf8, false), 
+
+        // orderbook data (full l20 as json string)
+        Field::new("bids_json", DataType::Utf8, false),
+        Field::new("asks_json", DataType::Utf8, false),
     ]);
     let schema_ref = Arc::new(schema);
-    let file = File::create("market_data.parquet").expect("error");
-    let mut writer = ArrowWriter::try_new(file, schema_ref.clone(), None).expect("initialization error");
 
+    let file = File::create("binance_full_depth.parquet").expect("create file error");
+    let mut writer = ArrowWriter::try_new(file, schema_ref.clone(), None).expect("writer init error");
+
+    // builders
     let mut ts_builder = StringBuilder::new();
+    let mut type_builder = StringBuilder::new();
+    let mut lat_builder = Int64Builder::new();
     let mut sym_builder = StringBuilder::new();
-    let mut bid_p_builder = Float64Builder::new();
-    let mut bid_q_builder = Float64Builder::new();
-    let mut ask_p_builder = Float64Builder::new();
-    let mut ask_q_builder = Float64Builder::new();
+    
+    let mut tp_builder = Float64Builder::new(); 
+    let mut tq_builder = Float64Builder::new(); 
+    let mut ts_side_builder = StringBuilder::new(); 
+    
+    let mut bids_builder = StringBuilder::new(); 
+    let mut asks_builder = StringBuilder::new(); 
 
-    // connection: bybit/mainnet/futures
-    let connect_addr: &str= "wss://stream.bybit.com/v5/public/linear";
-    let url= Url::parse(connect_addr).unwrap();
+    let connect_addr = "wss://stream.binance.com:9443/ws/btcusdc@depth20@100ms/btcusdc@trade";
+    let url = Url::parse(connect_addr).unwrap();
+
     println!("connecting...");
-
-    let (ws_stream, _)= connect_async(url)
-        .await
-        .expect("failed to connect");
+    let (ws_stream, _) = connect_async(url).await.expect("connection failed");
     println!("connected");
 
-    let (mut write, mut read)= ws_stream.split();
-    let subscribe_msg= r#"{"op": "subscribe", "args": ["orderbook.1.BTCUSDT"]}"#;
+    let (_, mut read) = ws_stream.split();
+    let mut count = 0;
 
-    write.send(Message::Text(subscribe_msg.to_string()))
-        .await
-        .expect("failed to send subscription message");
-    
-    let mut count= 0;    
-
-    println!("waiting for data...");
-
-    //loop
-    while let Some(msg)= read.next().await {
-
+    while let Some(msg) = read.next().await {
         if start_time.elapsed() > max_duration {
-            println!("\n time's up!");
-            break; 
+            println!("\ntime's up!");
+            break;
         }
 
         match msg {
-            Ok(message)=> {
-                if let Message::Text(text)= message {
-                    if let Ok(parsed) = serde_json::from_str::<BybitResponse>(&text) {
-                            if let Some(data)= parsed.data {
-                                let best_bid= data.b.get(0);
-                                let best_ask= data.asks.get(0);
+            Ok(message) => {
+                if let tokio_tungstenite::tungstenite::protocol::Message::Text(text) = message {
+                    
+                    let now = Utc::now();
+                    let local_ts_ms = now.timestamp_millis();
+                    let time_str = now.format("%H:%M:%S%.3f").to_string();
+
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        
+                        let mut event_type = "UNKNOWN";
+                        let mut latency: i64 = 0;
+                        let symbol = "BTCUSDC";
+                        
+                        // temp vars
+                        let mut t_price = 0.0;
+                        let mut t_qty = 0.0;
+                        let mut t_side = "";
+                        let mut bids_str = "".to_string();
+                        let mut asks_str = "".to_string();
+
+                        // 1. handle trade
+                        if v.get("e") == Some(&Value::String("trade".to_string())) {
+                            event_type = "TRADE";
+                            let trade_time = v["T"].as_i64().unwrap_or(local_ts_ms);
+                            latency = local_ts_ms - trade_time;
+                            
+                            t_price = v["p"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                            t_qty = v["q"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                            
+                            // is maker? true=sell, false=buy
+                            let is_maker = v["m"].as_bool().unwrap_or(false); 
+                            t_side = if is_maker { "SELL" } else { "BUY" };
+
+                        // 2. handle depth (l20)
+                        } else if !v["bids"].is_null() {
+                            event_type = "DEPTH";
+                            latency = -1;
+                            
+                            // save full array as json string
+                            bids_str = v["bids"].to_string();
+                            asks_str = v["asks"].to_string();
+                        }
+
+                        if event_type != "UNKNOWN" {
+                            ts_builder.append_value(&time_str);
+                            type_builder.append_value(event_type);
+                            lat_builder.append_value(latency);
+                            sym_builder.append_value(symbol);
+                            
+                            // fill columns
+                            if event_type == "TRADE" {
+                                tp_builder.append_value(t_price);
+                                tq_builder.append_value(t_qty);
+                                ts_side_builder.append_value(t_side);
+                                bids_builder.append_value(""); 
+                                asks_builder.append_value(""); 
+                            } else {
+                                tp_builder.append_value(0.0);
+                                tq_builder.append_value(0.0);
+                                ts_side_builder.append_value("");
+                                bids_builder.append_value(&bids_str); 
+                                asks_builder.append_value(&asks_str); 
+                            }
+
+                            count += 1;
+
+                            // terminal preview
+                            if event_type == "TRADE" {
+                                println!("[TRADE] latency: {}ms | price: {} | side: {}", latency, t_price, t_side);
+                            }
+
+                            if count >= BATCH_SIZE {
+                                let batch = RecordBatch::try_new(
+                                    schema_ref.clone(),
+                                    vec![
+                                        Arc::new(ts_builder.finish()),
+                                        Arc::new(type_builder.finish()),
+                                        Arc::new(lat_builder.finish()),
+                                        Arc::new(sym_builder.finish()),
+                                        Arc::new(tp_builder.finish()),
+                                        Arc::new(tq_builder.finish()),
+                                        Arc::new(ts_side_builder.finish()),
+                                        Arc::new(bids_builder.finish()),
+                                        Arc::new(asks_builder.finish()),
+                                    ],
+                                ).unwrap();
+
+                                writer.write(&batch).expect("write error");
                                 
-                                // POPRAWKA 2 i 3:
-                                // Najpierw sprawdzamy czy bid i ask istnieją (if let)
-                                // Dopiero w środku tworzymy zmienne bp, bq...
-                                if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                                    
-                                    // POPRAWKA 4: Przywrócono obliczanie czasu (time_str)
-                                    let d = std::time::UNIX_EPOCH + Duration::from_millis(parsed.ts);
-                                    let time_str = DateTime::<Utc>::from(d).format("%H:%M:%S%.3f").to_string();
-
-                                    let bp = bid[0].parse::<f64>().unwrap_or(0.0);
-                                    let bq = bid[1].parse::<f64>().unwrap_or(0.0);
-                                    let ap = ask[0].parse::<f64>().unwrap_or(0.0);
-                                    let aq = ask[1].parse::<f64>().unwrap_or(0.0);
-
-                                    ts_builder.append_value(&time_str);
-                                    sym_builder.append_value(&data.symbol);
-                                    bid_p_builder.append_value(bp);
-                                    bid_q_builder.append_value(bq);
-                                    ask_p_builder.append_value(ap);
-                                    ask_q_builder.append_value(aq);
-
-                                    count += 1;
-
-                                    let remaining = max_duration.saturating_sub(start_time.elapsed()).as_secs();
-                                    let rem_h = remaining / 3600;
-                                    let rem_m = (remaining % 3600) / 60;
-                                    print!("\rPrice: ${} | Bufor: {}/{} | Left: {:02}h {:02}m", bp, count, BATCH_SIZE, rem_h, rem_m);
-
-                                    if count >= BATCH_SIZE {
-                                        // println!("\n saving batch..."); // Opcjonalne
-
-                                        let batch = RecordBatch::try_new(
-                                            schema_ref.clone(),
-                                            vec![
-                                                Arc::new(ts_builder.finish()),
-                                                Arc::new(sym_builder.finish()),
-                                                Arc::new(bid_p_builder.finish()),
-                                                Arc::new(bid_q_builder.finish()),
-                                                Arc::new(ask_p_builder.finish()),
-                                                Arc::new(ask_q_builder.finish()),
-                                            ],
-                                        ).unwrap();
-                                        
-                                        writer.write(&batch).expect("saving error");
-                                        // writer.flush().expect("flushing error"); // ArrowWriter robi to sam
-
-                                        count = 0;
-                                        ts_builder = StringBuilder::new();
-                                        sym_builder = StringBuilder::new();
-                                        bid_p_builder = Float64Builder::new();
-                                        bid_q_builder = Float64Builder::new();
-                                        ask_p_builder = Float64Builder::new();
-                                        ask_q_builder = Float64Builder::new();
-                                    } 
-                                } // Koniec if let
-                            }                       
+                                ts_builder = StringBuilder::new();
+                                type_builder = StringBuilder::new();
+                                lat_builder = Int64Builder::new();
+                                sym_builder = StringBuilder::new();
+                                tp_builder = Float64Builder::new();
+                                tq_builder = Float64Builder::new();
+                                ts_side_builder = StringBuilder::new();
+                                bids_builder = StringBuilder::new();
+                                asks_builder = StringBuilder::new();
+                                count = 0;
+                            }
+                        }
                     }
-                } 
+                }
             }
-            Err(e)=> {
+            Err(e) => {
                 eprintln!("network error: {:?}", e);
                 break;
             }
         }
     }
+
     println!("\nclosing parquet...");
     writer.close().unwrap();
-    println!("market_data.parquet is saved");
+    println!("done");
 }
