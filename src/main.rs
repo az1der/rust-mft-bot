@@ -1,194 +1,150 @@
-// change to Binance due to API limitations
+// mft pro 24h silent mode
 
 // import
 use futures_util::StreamExt;
-use tokio_tungstenite::connect_async;
-use url::Url;
-use chrono::{DateTime, Utc};
-use std::time::{Duration, Instant};
-use std::fs::File;
-use std::sync::Arc;
-use serde_json::Value;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::fs::{OpenOptions, create_dir_all};
+use tokio::io::AsyncWriteExt;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use sysinfo::{System, Pid};
+use chrono::prelude::*;
+use async_compression::tokio::write::ZstdEncoder;
 
-use arrow::array::{Float64Builder, StringBuilder, Int64Builder, Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
+#[derive(Debug, Deserialize)]
+struct DepthUpdate {
+    #[serde(rename = "E")] event_time: u64,
+    #[serde(rename = "b")] bids: Vec<Vec<String>>,
+    #[serde(rename = "a")] asks: Vec<Vec<String>>,
+}
 
-// 10 min of collecting data
-const BATCH_SIZE: usize = 100;
-const RUN_TIME_MINUTES: u64 = 10;
+fn price_to_u64(price_str: &str) -> u64 {
+    let price_f64: f64 = price_str.parse().unwrap_or(0.0);
+    (price_f64 * 100_000_000.0) as u64 
+}
+
+fn qty_to_f64(qty_str: &str) -> f64 {
+    qty_str.parse().unwrap_or(0.0)
+}
 
 #[tokio::main]
 async fn main() {
-    println!("binance full-depth collector (l20 + trades)...");
-
+    let url = "wss://fstream.binance.com/ws/btcusdt@depth"; 
+    let log_dir = "data_logs";
+    
+    // settings
+    let file_rotation_interval = Duration::from_secs(24 * 60 * 60); // 24h
+    let snapshot_interval = Duration::from_millis(20);              // 50hz
+    
+    create_dir_all(log_dir).await.expect("dir create error");
+    let mut sys = System::new_all();
+    let pid = Pid::from(std::process::id() as usize);
     let start_time = Instant::now();
-    let max_duration = Duration::from_secs(RUN_TIME_MINUTES * 60);
 
-    // schema: json columns for bids/asks
-    let schema = Schema::new(vec![
-        Field::new("timestamp", DataType::Utf8, false),
-        Field::new("event_type", DataType::Utf8, false),
-        Field::new("latency_ms", DataType::Int64, false),
-        Field::new("symbol", DataType::Utf8, false),
-        
-        // trade data
-        Field::new("trade_price", DataType::Float64, false),
-        Field::new("trade_qty", DataType::Float64, false),
-        Field::new("trade_side", DataType::Utf8, false), 
-
-        // orderbook data (full l20 as json string)
-        Field::new("bids_json", DataType::Utf8, false),
-        Field::new("asks_json", DataType::Utf8, false),
-    ]);
-    let schema_ref = Arc::new(schema);
-
-    let file = File::create("binance_full_depth.parquet").expect("create file error");
-    let mut writer = ArrowWriter::try_new(file, schema_ref.clone(), None).expect("writer init error");
-
-    // builders
-    let mut ts_builder = StringBuilder::new();
-    let mut type_builder = StringBuilder::new();
-    let mut lat_builder = Int64Builder::new();
-    let mut sym_builder = StringBuilder::new();
+    let mut next_snapshot = Instant::now() + snapshot_interval;
+    let mut next_rotation = Instant::now() + file_rotation_interval;
     
-    let mut tp_builder = Float64Builder::new(); 
-    let mut tq_builder = Float64Builder::new(); 
-    let mut ts_side_builder = StringBuilder::new(); 
-    
-    let mut bids_builder = StringBuilder::new(); 
-    let mut asks_builder = StringBuilder::new(); 
+    // track full hours
+    let mut last_reported_hour: u64 = 0;
 
-    let connect_addr = "wss://stream.binance.com:9443/ws/btcusdc@depth20@100ms/btcusdc@trade";
-    let url = Url::parse(connect_addr).unwrap();
+    let mut local_bids: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut local_asks: BTreeMap<u64, f64> = BTreeMap::new();
 
-    println!("connecting...");
+    println!("--- MFT PRO: 24H SILENT MODE ---");
+    println!(">>> Cel: BTCUSDT | Snapshot: 20ms | Rotacja: 24h");
+    println!(">>> Logi: Tylko rotacja i status godzinowy (1/24...)");
+
     let (ws_stream, _) = connect_async(url).await.expect("connection failed");
-    println!("connected");
-
     let (_, mut read) = ws_stream.split();
-    let mut count = 0;
 
-    while let Some(msg) = read.next().await {
-        if start_time.elapsed() > max_duration {
-            println!("\ntime's up!");
-            break;
-        }
+    async fn create_new_encoder(dir: &str) -> ZstdEncoder<tokio::fs::File> {
+        let now: DateTime<Local> = Local::now();
+        let filename = format!("{}/mft_24h_{}.csv.zst", dir, now.format("%Y-%m-%d")); 
+        println!("\n>>> [SYSTEM START] creating file: {}", filename);
+        
+        let file = OpenOptions::new().create(true).append(true).open(filename).await.expect("file error");
+        let mut encoder = ZstdEncoder::new(file);
+        
+        let mut header = String::from("timestamp,latency");
+        for i in 0..20 { header.push_str(&format!(",bid_p{},bid_q{}", i, i)); }
+        for i in 0..20 { header.push_str(&format!(",ask_p{},ask_q{}", i, i)); }
+        header.push('\n');
+        let _ = encoder.write_all(header.as_bytes()).await;
+        
+        encoder
+    }
 
-        match msg {
-            Ok(message) => {
-                if let tokio_tungstenite::tungstenite::protocol::Message::Text(text) = message {
+    let mut current_encoder = create_new_encoder(log_dir).await;
+
+    while let Some(message) = read.next().await {
+        if let Ok(Message::Text(text)) = message {
+            if let Ok(update) = serde_json::from_str::<DepthUpdate>(&text) {
+                
+                // 1. update lob
+                for b in update.bids {
+                    let price = price_to_u64(&b[0]);
+                    let qty = qty_to_f64(&b[1]);
+                    if qty == 0.0 { local_bids.remove(&price); } else { local_bids.insert(price, qty); }
+                }
+                for a in update.asks {
+                    let price = price_to_u64(&a[0]);
+                    let qty = qty_to_f64(&a[1]);
+                    if qty == 0.0 { local_asks.remove(&price); } else { local_asks.insert(price, qty); }
+                }
+
+                // 2. file rotation (24h)
+                if Instant::now() >= next_rotation {
+                    println!("\n>>> [ROTATION 24H] closing old, opening new...");
+                    let _ = current_encoder.shutdown().await;
+                    current_encoder = create_new_encoder(log_dir).await;
+                    next_rotation = Instant::now() + file_rotation_interval;
                     
-                    let now = Utc::now();
-                    let local_ts_ms = now.timestamp_millis();
-                    let time_str = now.format("%H:%M:%S%.3f").to_string();
+                    // reset hour counter (optional)
+                    // last_reported_hour = 0; 
+                }
 
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        
-                        let mut event_type = "UNKNOWN";
-                        let mut latency: i64 = 0;
-                        let symbol = "BTCUSDC";
-                        
-                        // temp vars
-                        let mut t_price = 0.0;
-                        let mut t_qty = 0.0;
-                        let mut t_side = "";
-                        let mut bids_str = "".to_string();
-                        let mut asks_str = "".to_string();
+                // 3. save snapshot
+                if Instant::now() >= next_snapshot {
+                    let bids_l20: Vec<_> = local_bids.iter().rev().take(20).collect();
+                    let asks_l20: Vec<_> = local_asks.iter().take(20).collect();
 
-                        // 1. handle trade
-                        if v.get("e") == Some(&Value::String("trade".to_string())) {
-                            event_type = "TRADE";
-                            let trade_time = v["T"].as_i64().unwrap_or(local_ts_ms);
-                            latency = local_ts_ms - trade_time;
-                            
-                            t_price = v["p"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                            t_qty = v["q"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                            
-                            // is maker? true=sell, false=buy
-                            let is_maker = v["m"].as_bool().unwrap_or(false); 
-                            t_side = if is_maker { "SELL" } else { "BUY" };
+                    if bids_l20.len() >= 20 && asks_l20.len() >= 20 {
+                        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                        let mut line = format!("{},{}", now_ms, now_ms.saturating_sub(update.event_time));
 
-                        // 2. handle depth (l20)
-                        } else if !v["bids"].is_null() {
-                            event_type = "DEPTH";
-                            latency = -1;
-                            
-                            // save full array as json string
-                            bids_str = v["bids"].to_string();
-                            asks_str = v["asks"].to_string();
+                        for (price_u64, qty_f64) in bids_l20 { 
+                            let p_str = format!("{:.2}", *price_u64 as f64 / 100_000_000.0);
+                            line.push_str(&format!(",{},{:.8}", p_str, qty_f64)); 
                         }
-
-                        if event_type != "UNKNOWN" {
-                            ts_builder.append_value(&time_str);
-                            type_builder.append_value(event_type);
-                            lat_builder.append_value(latency);
-                            sym_builder.append_value(symbol);
-                            
-                            // fill columns
-                            if event_type == "TRADE" {
-                                tp_builder.append_value(t_price);
-                                tq_builder.append_value(t_qty);
-                                ts_side_builder.append_value(t_side);
-                                bids_builder.append_value(""); 
-                                asks_builder.append_value(""); 
-                            } else {
-                                tp_builder.append_value(0.0);
-                                tq_builder.append_value(0.0);
-                                ts_side_builder.append_value("");
-                                bids_builder.append_value(&bids_str); 
-                                asks_builder.append_value(&asks_str); 
-                            }
-
-                            count += 1;
-
-                            // terminal preview
-                            if event_type == "TRADE" {
-                                println!("[TRADE] latency: {}ms | price: {} | side: {}", latency, t_price, t_side);
-                            }
-
-                            if count >= BATCH_SIZE {
-                                let batch = RecordBatch::try_new(
-                                    schema_ref.clone(),
-                                    vec![
-                                        Arc::new(ts_builder.finish()),
-                                        Arc::new(type_builder.finish()),
-                                        Arc::new(lat_builder.finish()),
-                                        Arc::new(sym_builder.finish()),
-                                        Arc::new(tp_builder.finish()),
-                                        Arc::new(tq_builder.finish()),
-                                        Arc::new(ts_side_builder.finish()),
-                                        Arc::new(bids_builder.finish()),
-                                        Arc::new(asks_builder.finish()),
-                                    ],
-                                ).unwrap();
-
-                                writer.write(&batch).expect("write error");
-                                
-                                ts_builder = StringBuilder::new();
-                                type_builder = StringBuilder::new();
-                                lat_builder = Int64Builder::new();
-                                sym_builder = StringBuilder::new();
-                                tp_builder = Float64Builder::new();
-                                tq_builder = Float64Builder::new();
-                                ts_side_builder = StringBuilder::new();
-                                bids_builder = StringBuilder::new();
-                                asks_builder = StringBuilder::new();
-                                count = 0;
-                            }
+                        for (price_u64, qty_f64) in asks_l20 { 
+                            let p_str = format!("{:.2}", *price_u64 as f64 / 100_000_000.0);
+                            line.push_str(&format!(",{},{:.8}", p_str, qty_f64)); 
                         }
+                        line.push('\n');
+
+                        let _ = current_encoder.write_all(line.as_bytes()).await;
+                        next_snapshot += snapshot_interval;
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("network error: {:?}", e);
-                break;
+
+                // 4. hourly status
+                let elapsed_secs = start_time.elapsed().as_secs();
+                let current_hour = elapsed_secs / 3600;
+
+                // log only on new hour (skip start)
+                if current_hour > last_reported_hour {
+                    sys.refresh_all();
+                    if let Some(proc) = sys.process(pid) {
+                        use std::io::Write;
+                        println!(">>> [STATUS] uptime: {}/24h | ram: {} mb", 
+                            current_hour, 
+                            proc.memory() / 1024 / 1024
+                        );
+                    }
+                    last_reported_hour = current_hour;
+                }
             }
         }
     }
-
-    println!("\nclosing parquet...");
-    writer.close().unwrap();
-    println!("done");
 }
